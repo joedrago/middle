@@ -163,7 +163,7 @@ static void createShellIcon(HWND hDlg)
     nid.uVersion = NOTIFYICON_VERSION;
     nid.uCallbackMessage = WM_SHELLICONCLICKED;
     nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_MIDDLE));
-    strcpy(nid.szTip, "There");
+    strcpy(nid.szTip, "Middle");
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 
     Shell_NotifyIcon(NIM_ADD, &nid);
