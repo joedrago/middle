@@ -1,338 +1,252 @@
-#include "targetver.h"
+#include "Middle.h"
 
-#define _CRT_SECURE_NO_WARNINGS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "helpers.h"
 
-#include <shellapi.h>
-#include <sstream>
-#include <stdbool.h>
-#include <stdio.h>
-#include <string>
-#include <vector>
+#define ARBITRARY_BUFFER_SIZE 4096
 
-#include "resource.h"
+#define TOML_EXCEPTIONS 0
+#include "toml.h"
 
-#define WM_SHELLICONCLICKED (WM_USER + 1)
-
-// --------------------------------------------------------------------------------------
-// Globals! Yuck!
-
-HMENU contextMenu_;
-
-// Determined in loadConfig() (including defaults)
-static bool runOnStartup_;
-static std::string hotKey_;
-static int offsetX_;
-static int offsetY_;
-static int width_;
-static int height_;
-
-// --------------------------------------------------------------------------------------
-// Generic helper functions
-
-static bool fatalError(const char * format, ...)
+static const char * exactString(bool exact)
 {
-    char errorText[4096];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(errorText, sizeof(errorText), format, args);
-    MessageBox(NULL, errorText, "Middle: Fatal Error", MB_OK);
-    PostQuitMessage(0);
-    return false;
+    return exact ? "exact" : "substr";
 }
 
-// taken shamelessly from http://stackoverflow.com/questions/236129/split-a-string-in-c
-static void split(const std::string & s, char delim, std::vector<std::string> & elems)
+static const std::string getConfigFilename()
 {
-    std::stringstream ss;
-    ss.str(s);
-    std::string item;
-    while (std::getline(ss, item, delim)) {
-        elems.push_back(item);
+    return getExeAdjacentFile("middle.toml");
+}
+
+static const std::string makeToml(const toml::table & tbl)
+{
+    auto formatFlags = toml::toml_formatter::default_flags & ~toml::format_flags::allow_literal_strings;
+    std::ostringstream ss;
+    ss << toml::toml_formatter(tbl, formatFlags);
+    return ss.str() + "\n";
+}
+
+Middle::Middle()
+{
+}
+
+Middle::~Middle()
+{
+}
+
+bool Middle::parseConfig()
+{
+    logDebug("Middle::init()\n");
+
+    auto result = toml::parse_file(getConfigFilename());
+    if (!result) {
+        const std::string error = std::string(result.error().description());
+        return fatalError("Parsing failed: %s", error.c_str());
     }
-}
+    auto config = std::move(result).table();
 
-// From: https://stackoverflow.com/questions/216823/how-to-trim-a-stdstring
-static inline void ltrim(std::string & s)
-{
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
-}
-static inline void rtrim(std::string & s)
-{
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
-}
-static inline void trim(std::string & s)
-{
-    rtrim(s);
-    ltrim(s);
-}
+    // Basic global settings
+    persist_ = config["persist"].value_or(false);
+    runOnStartup_ = config["startup"].value_or(false);
+    hotkey_ = config["hotkey"].value<std::string>().value_or("win+N");
+    logDebug("hotkey: %s\n", hotkey_.c_str());
+    defaultX_ = config["x"].value<int>().value_or(0);
+    defaultY_ = config["y"].value<int>().value_or(0);
+    defaultW_ = config["w"].value<int>().value_or(0);
+    defaultH_ = config["h"].value<int>().value_or(0);
 
-// --------------------------------------------------------------------------------------
-// Registry nonsense
+    // Per-automatic setting
+    auto automatic = config["automatic"];
+    if (!!automatic) {
+        toml::array * arr = automatic.as_array();
+        for (auto it = arr->begin(); it != arr->end(); ++it) {
+            Automatic a;
+            a.index = (int)automatics_.size();
+            a.x = it->at_path("x").value<int>().value_or(0);
+            a.y = it->at_path("y").value<int>().value_or(0);
+            a.w = it->at_path("w").value<int>().value_or(0);
+            a.h = it->at_path("h").value<int>().value_or(0);
+            a.titleString = it->at_path("title").value<std::string>().value_or("");
+            a.classString = it->at_path("class").value<std::string>().value_or("");
+            a.exactTitle = it->at_path("exactTitle").value<bool>().value_or(true);
+            a.exactClass = it->at_path("exactClass").value<bool>().value_or(true);
 
-static bool runOnStartup(bool enabled)
-{
-    char buffer[MAX_PATH];
-    if (GetModuleFileName(NULL, (char *)buffer, MAX_PATH) == ERROR_INSUFFICIENT_BUFFER) {
-        return fatalError("Not enough room to get module filename?");
-    }
+            logDebug("automatic[%d] [%d/%d/%d/%d] title[%s]:\"%s\" class[%s]:\"%s\"\n",
+                     a.index,
+                     a.x,
+                     a.y,
+                     a.w,
+                     a.h,
+                     exactString(a.exactTitle),
+                     a.titleString.c_str(),
+                     exactString(a.exactClass),
+                     a.classString.c_str());
 
-    HKEY hkey;
-    LONG RegOpenResult;
-    RegOpenResult = RegOpenKeyEx(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_WRITE, &hkey);
-    if (enabled) {
-        auto wut = RegSetValueEx(hkey, "Middle", 0, REG_SZ, (unsigned char *)buffer, (DWORD)strlen(buffer));
-        printf("lol");
-    } else {
-        RegDeleteValueA(hkey, "Middle");
-    }
-    RegCloseKey(hkey);
-    return true;
-}
-
-// --------------------------------------------------------------------------------------
-// Hotkey nonsense
-
-static bool addHotKey(HWND hWnd, int id, const std::string & keyText)
-{
-    unsigned int mods = 0;
-
-    unsigned int key = 0;
-    std::vector<std::string> pieces;
-    split(keyText, '+', pieces);
-    if (pieces.empty()) {
-        return fatalError("action has an empty key string");
-    }
-
-    for (std::vector<std::string>::iterator it = pieces.begin(); it != pieces.end(); ++it) {
-        if (*it == "win") {
-            mods |= MOD_WIN;
-        } else if (*it == "alt") {
-            mods |= MOD_ALT;
-        } else if ((*it == "ctrl") || (*it == "ctl") || (*it == "control")) {
-            mods |= MOD_CONTROL;
-        } else if (*it == "shift") {
-            mods |= MOD_SHIFT;
-        } else if (*it == "up") {
-            key = VK_UP;
-        } else if (*it == "down") {
-            key = VK_DOWN;
-        } else if (*it == "left") {
-            key = VK_LEFT;
-        } else if (*it == "space") {
-            key = VK_SPACE;
-        } else if (*it == "right") {
-            key = VK_RIGHT;
-        } else {
-            if (it->size() != 1) {
-                return fatalError("Unknown key element: %s", it->c_str());
-            }
-            key = (unsigned int)((*it)[0]);
+            automatics_.push_back(a);
         }
     }
 
-    if (key == 0) {
-        return fatalError("Did not provide an actual key to press: ", keyText.c_str());
-    }
-
-    if (!RegisterHotKey(hWnd, id, mods | MOD_NOREPEAT, key)) {
-        return fatalError("Failed to register hotkey: %s", keyText.c_str());
-    }
     return true;
 }
 
-static bool registerHotKeys(HWND hWnd)
+bool Middle::init()
 {
-    if (!addHotKey(hWnd, 1, hotKey_)) {
+    logDebug("Middle::init()\n");
+
+    if (!parseConfig()) {
         return false;
-    }
-    return true;
-}
-
-// --------------------------------------------------------------------------------------
-// Shell icon nonsense
-
-static void createShellIcon(HWND hDlg)
-{
-    NOTIFYICONDATA nid;
-
-    nid.cbSize = sizeof(NOTIFYICONDATA);
-    nid.hWnd = hDlg;
-    nid.uID = 100;
-    nid.uVersion = NOTIFYICON_VERSION;
-    nid.uCallbackMessage = WM_SHELLICONCLICKED;
-    nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_MIDDLE));
-    strcpy(nid.szTip, "Middle");
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-
-    Shell_NotifyIcon(NIM_ADD, &nid);
-}
-
-static void destroyShellIcon(HWND hDlg)
-{
-    NOTIFYICONDATA nid;
-    nid.cbSize = sizeof(NOTIFYICONDATA);
-    nid.hWnd = hDlg;
-    nid.uID = 100;
-    Shell_NotifyIcon(NIM_DELETE, &nid);
-}
-
-// --------------------------------------------------------------------------------------
-// The "middle" of Middle
-
-static void moveForegroundWindow()
-{
-    HWND foregroundWindow = GetForegroundWindow();
-    RECT destinationRect = { offsetX_, offsetY_, width_, height_ };
-
-    // Nuke various style flags to make it borderless
-    LONG style = GetWindowLong(foregroundWindow, GWL_STYLE);
-    SetWindowLong(foregroundWindow, GWL_STYLE, style & ~(WS_BORDER | WS_CAPTION | WS_DLGFRAME | WS_OVERLAPPEDWINDOW | WS_POPUPWINDOW));
-
-    MoveWindow(foregroundWindow, destinationRect.left, destinationRect.top, destinationRect.right, destinationRect.bottom, TRUE);
-}
-
-// --------------------------------------------------------------------------------------
-// Configuration
-
-static void loadDefaults()
-{
-    runOnStartup_ = true;
-    hotKey_ = "win+N";
-
-    offsetX_ = 0;
-    offsetY_ = 0;
-    width_ = GetSystemMetrics(SM_CXSCREEN);
-    height_ = GetSystemMetrics(SM_CYSCREEN);
-}
-
-static bool loadConfig()
-{
-    loadDefaults();
-
-    char buffer[MAX_PATH];
-    if (GetModuleFileName(NULL, (char *)buffer, MAX_PATH) == ERROR_INSUFFICIENT_BUFFER) {
-        return fatalError("Not enough room to get module filename?");
-    }
-
-    std::string modulePath = buffer;
-    size_t pos = modulePath.find_last_of('\\');
-    if (pos == std::string::npos) {
-        return fatalError("Module filename does not contain a backslash?");
-    }
-
-    std::string iniPath = modulePath.substr(0, pos) + "\\middle.ini";
-    FILE * f = fopen(iniPath.c_str(), "rb");
-    if (!f) {
-        return fatalError("middle.ini does not exist next to middle.exe");
-    }
-
-    fseek(f, 0, SEEK_END);
-    int len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (len < 1) {
-        return fatalError("middle.ini is empty");
-    }
-
-    std::vector<char> raw(len + 1);
-    size_t bytesRead = fread(&raw[0], 1, len, f);
-    fclose(f);
-    if (bytesRead != len) {
-        return fatalError("failed to read all %d bytes of middle.ini", len);
-    }
-
-    std::string contents = raw.data();
-    std::vector<std::string> lines;
-    split(contents, '\n', lines);
-
-    for (auto it = lines.begin(); it != lines.end(); ++it) {
-        std::string line = *it;
-        trim(line);
-        if ((line.size() > 0) && (line[0] == '#')) {
-            // Comment!
-            continue;
-        }
-
-        std::vector<std::string> pieces;
-        split(line, '=', pieces);
-        if (pieces.size() == 2) {
-            const std::string & key = pieces[0];
-            const std::string & val = pieces[1];
-            if (key == "hotkey") {
-                hotKey_ = val;
-            } else if (key == "startup") {
-                runOnStartup_ = ((val == "true") || (val == "1") || (val == "on") || (val == "yes"));
-            } else if (key == "x") {
-                offsetX_ = atoi(val.c_str());
-            } else if (key == "y") {
-                offsetY_ = atoi(val.c_str());
-            } else if (key == "w") {
-                width_ = atoi(val.c_str());
-            } else if (key == "h") {
-                height_ = atoi(val.c_str());
-            }
-        }
-    }
-    return true;
-}
-
-// --------------------------------------------------------------------------------------
-// Windows nonsense
-
-static INT_PTR CALLBACK Proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message) {
-        case WM_INITDIALOG:
-            createShellIcon(hDlg);
-            registerHotKeys(hDlg);
-            return (INT_PTR)TRUE;
-
-        case WM_SHELLICONCLICKED:
-            switch (lParam) {
-                case WM_LBUTTONDOWN:
-                case WM_RBUTTONDOWN:
-                    POINT p;
-                    GetCursorPos(&p);
-                    TrackPopupMenu(GetSubMenu(contextMenu_, 0), TPM_TOPALIGN | TPM_LEFTALIGN, p.x, p.y, 0, hDlg, nullptr);
-                    break;
-            }
-            return (INT_PTR)TRUE;
-
-        case WM_HOTKEY:
-            moveForegroundWindow();
-            return (INT_PTR)TRUE;
-
-        case WM_COMMAND:
-            if (LOWORD(wParam) == IDC_QUIT) {
-                destroyShellIcon(hDlg);
-                PostQuitMessage(0);
-                return (INT_PTR)TRUE;
-            } else if (LOWORD(wParam) == IDCANCEL) {
-                return (INT_PTR)TRUE;
-            }
-            break;
-    }
-    return (INT_PTR)FALSE;
-}
-
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
-{
-    if (!loadConfig()) {
-        return 0;
     }
 
     runOnStartup(runOnStartup_);
+    return true;
+}
 
-    contextMenu_ = LoadMenu(hInstance, MAKEINTRESOURCE(IDR_MIDDLE_CONTEXT_MENU));
-
-    HWND hDlg = CreateDialog(hInstance, MAKEINTRESOURCE(IDD_MIDDLE), NULL, Proc);
-    ShowWindow(hDlg, SW_HIDE);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+void Middle::onTick()
+{
+    HWND foregroundWindow = GetForegroundWindow();
+    if (!foregroundWindow) {
+        return;
     }
-    return 0;
+
+    char windowTitleBuffer[ARBITRARY_BUFFER_SIZE];
+    if (!GetWindowText(foregroundWindow, windowTitleBuffer, ARBITRARY_BUFFER_SIZE)) {
+        return;
+    }
+    const std::string & windowTitle = windowTitleBuffer;
+
+    char windowClassBuffer[ARBITRARY_BUFFER_SIZE];
+    if (!GetClassName(foregroundWindow, windowClassBuffer, ARBITRARY_BUFFER_SIZE)) {
+    }
+    const std::string & windowClass = windowClassBuffer;
+
+    RECT windowRect;
+    GetWindowRect(foregroundWindow, &windowRect);
+    const int currentX = windowRect.left;
+    const int currentY = windowRect.top;
+    const int currentW = windowRect.right - windowRect.left;
+    const int currentH = windowRect.bottom - windowRect.top;
+
+    const LONG currentStyle = GetWindowLong(foregroundWindow, GWL_STYLE);
+    const LONG requestedStyle = currentStyle & ~(WS_BORDER | WS_CAPTION | WS_DLGFRAME | WS_OVERLAPPEDWINDOW | WS_POPUPWINDOW);
+
+    logDebug("Foreground[%d/%d/%d/%d] \"%s\" \"%s\"\n",
+             windowRect.left,
+             windowRect.top,
+             windowRect.right,
+             windowRect.bottom,
+             windowTitle.c_str(),
+             windowClass.c_str());
+
+    // See if this window matches one of our automatics
+    Automatic * found = nullptr;
+    for (auto it = automatics_.begin(); it != automatics_.end(); ++it) {
+        if (it->exactTitle) {
+            if (windowTitle != it->titleString) {
+                continue;
+            }
+        } else {
+            if (windowTitle.find(it->titleString) == std::string::npos) {
+                continue;
+            }
+        }
+
+        if (it->exactClass) {
+            if (windowClass != it->classString) {
+                continue;
+            }
+        } else {
+            if (windowClass.find(it->classString) == std::string::npos) {
+                continue;
+            }
+        }
+
+        found = &(*it);
+        break;
+    }
+    if (!found) {
+        logDebug(" * Foreground not a current automatic window\n");
+        return;
+    }
+    logDebug(" * Found automatic index %d\n", found->index);
+
+    int x = defaultX_;
+    int y = defaultY_;
+    int w = defaultW_;
+    int h = defaultH_;
+    if (found->x || found->y || found->w || found->h) {
+        x = found->x;
+        y = found->y;
+        w = found->w;
+        h = found->h;
+    }
+
+    if ((x == currentX) && (y == currentY) && (w == currentW) && (h == currentH) && (requestedStyle == currentStyle)) {
+        logDebug(" * Ignoring, window already happy\n");
+        return;
+    }
+
+    logDebug(" * Move -> [%d/%d/%d/%d] [%u]=>[%u]\n", x, y, w, h, currentStyle, requestedStyle);
+    SetWindowLong(foregroundWindow, GWL_STYLE, requestedStyle); // Nuke various style flags to make it borderless
+    MoveWindow(foregroundWindow, x, y, w, h, TRUE);             // Move it where it belongs
+}
+
+void Middle::onHotkey()
+{
+    logDebug("onHotkey()\n");
+
+    HWND foregroundWindow = GetForegroundWindow();
+    if (!foregroundWindow) {
+        return;
+    }
+
+    char windowTitleBuffer[ARBITRARY_BUFFER_SIZE];
+    if (!GetWindowText(foregroundWindow, windowTitleBuffer, ARBITRARY_BUFFER_SIZE)) {
+        return;
+    }
+    const std::string & windowTitle = windowTitleBuffer;
+
+    char windowClassBuffer[ARBITRARY_BUFFER_SIZE];
+    if (!GetClassName(foregroundWindow, windowClassBuffer, ARBITRARY_BUFFER_SIZE)) {
+    }
+    const std::string & windowClass = windowClassBuffer;
+
+    if (persist_) {
+        // clang-format off
+        std::string toAppend =
+            "\n[[automatic]]\n\n" +
+            makeToml(toml::table { { "title", windowTitle } }) +
+            makeToml(toml::table { { "exactTitle", true } }) +
+            "\n" +
+            makeToml(toml::table { { "class", windowClass } }) +
+            makeToml(toml::table { { "exactClass", true } });
+        // clang-format on
+
+        logDebug("Appending new entry and activating:\n%s\n", toAppend.c_str());
+        std::string contents;
+        if (!readEntireFile(getConfigFilename(), contents)) {
+            return;
+        }
+        contents += toAppend;
+        writeEntireFile(getConfigFilename(), contents);
+    }
+
+    // Add to live config and activate immediately
+    Automatic a;
+    a.index = (int)automatics_.size();
+    a.x = 0;
+    a.y = 0;
+    a.w = 0;
+    a.h = 0;
+    a.titleString = windowTitle;
+    a.classString = windowClass;
+    a.exactTitle = true;
+    a.exactClass = true;
+    automatics_.push_back(a);
+    onTick();
+}
+
+void Middle::onEditConfig()
+{
+    logDebug("onEditConfig()\n");
+
+    ShellExecute(nullptr, nullptr, getConfigFilename().c_str(), nullptr, nullptr, SW_SHOW);
 }
